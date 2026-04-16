@@ -1,4 +1,4 @@
-# Claude Code / Claw Code 使用指南
+# OpenCode 使用指南
 
 > **说明**：本目录中的 `claude-code` 是 [instructkr/claw-code](https://github.com/instructkr/claw-code) 的本地克隆 —— 一个对 Anthropic Claude Code Agent Harness 的 Clean-Room Python 重写。原始 TypeScript 代码由 Anthropic 泄漏，claw-code 团队从架构层面进行了 Python 移植，不包含原始专有代码。
 
