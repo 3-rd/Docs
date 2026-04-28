@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-// ErrLockNotHeld is returned when Release is called by a non-holder.
-var ErrLockNotHeld = errors.New("lock not held by the given holder")
+// ErrLockNotHeld is returned when Release is called but the lock is not held.
+var ErrLockNotHeld = errors.New("lock not held")
 
 // ErrLockAcquireTimeout is returned when lock acquisition times out.
 var ErrLockAcquireTimeout = errors.New("lock acquisition timeout")
@@ -20,23 +20,16 @@ type LockKey struct {
 	Release   string
 }
 
-// String returns a human-readable key string.
 func (k LockKey) String() string {
 	return fmt.Sprintf("%s:%s", k.Namespace, k.Release)
-}
-
-// WaiterResult carries the result of a wait-for-lock operation.
-type WaiterResult struct {
-	Locked bool
-	Err    error
 }
 
 // LockEntry holds the state of a lock and its waiting goroutines.
 type LockEntry struct {
 	mu      sync.Mutex
 	holder  string
-	expAt   int64  // Unixnano; 0 means not locked
-	waiters []chan WaiterResult
+	expAt   int64 // Unixnano; 0 means not locked
+	waiters []chan struct{}
 }
 
 // LockManager manages exclusive locks per (namespace, release).
@@ -46,7 +39,7 @@ type LockManager struct {
 	locks map[LockKey]*LockEntry
 
 	cleanupInterval time.Duration
-	stopCleanup     chan struct{}
+	stopCleanup    chan struct{}
 }
 
 // NewLockManager creates a LockManager.
@@ -65,7 +58,6 @@ func NewLockManager(cleanupInterval time.Duration) *LockManager {
 }
 
 // Shutdown stops the background cleanup goroutine.
-// After Shutdown, the LockManager should not be used.
 func (m *LockManager) Shutdown() {
 	close(m.stopCleanup)
 }
@@ -88,7 +80,6 @@ func (m *LockManager) cleanupLoop() {
 				entry.holder = ""
 				entry.expAt = 0
 				for _, ch := range entry.waiters {
-					ch <- WaiterResult{Locked: false, Err: ErrLockAcquireTimeout}
 					close(ch)
 				}
 				entry.waiters = nil
@@ -102,28 +93,27 @@ func (m *LockManager) cleanupLoop() {
 	}
 }
 
-// Acquire attempts to acquire the lock for (namespace, release).
-// If the lock is already held, it waits up to 'timeout'.
-// Returns (true, nil) on success, (false, err) on timeout or cancellation.
+// Acquire acquires the exclusive lock for (namespace, release).
+// It waits up to 'timeout' for the lock. If the timeout is reached, returns false.
+// Use context only for cancellation; use timeout for the hard time limit.
 func (m *LockManager) Acquire(
 	ctx context.Context,
 	namespace, release string,
 	timeout time.Duration,
-	holderID string,
 ) (bool, error) {
 	if timeout <= 0 {
-		return false, fmt.Errorf("timeout must be positive: %v", timeout)
+		return false, fmt.Errorf("timeout must be positive")
 	}
 	key := LockKey{Namespace: namespace, Release: release}
 	deadline := time.Now().Add(timeout)
 
-	// Fast path: try to grab an existing lock or create a new one.
-	if ok, _ := m.tryAcquire(key, holderID, deadline); ok {
+	// Fast path: try to acquire directly.
+	if m.tryAcquire(key, deadline) {
 		return true, nil
 	}
 
-	// Slow path: register as a waiter and wait.
-	resultCh := make(chan WaiterResult, 1)
+	// Slow path: register as a waiter.
+	waitCh := make(chan struct{})
 	func() {
 		m.mu.Lock()
 		defer m.mu.Unlock()
@@ -134,41 +124,35 @@ func (m *LockManager) Acquire(
 		}
 		entry.mu.Lock()
 		defer entry.mu.Unlock()
-		// Double-check after acquiring entry lock.
 		if entry.holder == "" || time.Now().UnixNano() >= entry.expAt {
-			entry.holder = holderID
+			entry.holder = "locked"
 			entry.expAt = deadline.UnixNano()
 			entry.mu.Unlock()
-			resultCh <- WaiterResult{Locked: true}
-			close(resultCh)
+			close(waitCh)
 			return
 		}
-		entry.waiters = append(entry.waiters, resultCh)
+		entry.waiters = append(entry.waiters, waitCh)
 		entry.mu.Unlock()
 	}()
 
-	// Use a timer to avoid time.After goroutine leak when resultCh fires first.
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
 
 	select {
 	case <-ctx.Done():
-		m.removeWaiter(key, resultCh)
+		m.removeWaiter(key, waitCh)
 		return false, ctx.Err()
-	case result, ok := <-resultCh:
-		if !ok {
-			return false, ErrLockAcquireTimeout
-		}
-		return result.Locked, result.Err
+	case <-waitCh:
+		return true, nil
 	case <-timer.C:
-		m.removeWaiter(key, resultCh)
+		m.removeWaiter(key, waitCh)
 		return false, ErrLockAcquireTimeout
 	}
 }
 
-// tryAcquire attempts a single optimistic lock acquisition.
-// Returns (true) if acquired, (false) if contention exists.
-func (m *LockManager) tryAcquire(key LockKey, holderID string, deadline time.Time) (bool, error) {
+// tryAcquire attempts a single optimistic acquisition.
+// Returns true if acquired.
+func (m *LockManager) tryAcquire(key LockKey, deadline time.Time) bool {
 	m.mu.Lock()
 	entry, exists := m.locks[key]
 	if !exists {
@@ -176,26 +160,26 @@ func (m *LockManager) tryAcquire(key LockKey, holderID string, deadline time.Tim
 		m.locks[key] = entry
 		m.mu.Unlock()
 		entry.mu.Lock()
-		entry.holder = holderID
+		entry.holder = "locked"
 		entry.expAt = deadline.UnixNano()
 		entry.mu.Unlock()
-		return true, nil
+		return true
 	}
 	m.mu.Unlock()
 
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 	if entry.holder == "" || time.Now().UnixNano() >= entry.expAt {
-		entry.holder = holderID
+		entry.holder = "locked"
 		entry.expAt = deadline.UnixNano()
-		return true, nil
+		return true
 	}
-	return false, nil
+	return false
 }
 
-// removeWaiter removes a waiting channel from the entry's waiters list.
+// removeWaiter removes a waiter channel from the entry.
 // Must be called while holding m.mu.
-func (m *LockManager) removeWaiter(key LockKey, ch chan WaiterResult) {
+func (m *LockManager) removeWaiter(key LockKey, ch chan struct{}) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	entry, exists := m.locks[key]
@@ -209,14 +193,14 @@ func (m *LockManager) removeWaiter(key LockKey, ch chan WaiterResult) {
 			l := len(entry.waiters)
 			entry.waiters[i] = entry.waiters[l-1]
 			entry.waiters = entry.waiters[:l-1]
-			break
+			return
 		}
 	}
 }
 
-// Release releases the lock for (namespace, release) held by holderID.
-// Returns nil on success, ErrLockNotHeld if the holder does not own the lock.
-func (m *LockManager) Release(namespace, release, holderID string) error {
+// Release releases the lock for (namespace, release).
+// Returns ErrLockNotHeld if the lock is not currently held.
+func (m *LockManager) Release(namespace, release string) error {
 	key := LockKey{Namespace: namespace, Release: release}
 	m.mu.Lock()
 	entry, exists := m.locks[key]
@@ -227,7 +211,7 @@ func (m *LockManager) Release(namespace, release, holderID string) error {
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 
-	if entry.holder != holderID {
+	if entry.holder == "" {
 		m.mu.Unlock()
 		return ErrLockNotHeld
 	}
@@ -235,34 +219,11 @@ func (m *LockManager) Release(namespace, release, holderID string) error {
 	entry.holder = ""
 	entry.expAt = 0
 	for _, ch := range entry.waiters {
-		ch <- WaiterResult{Locked: false, Err: nil}
 		close(ch)
 	}
 	entry.waiters = nil
 	m.mu.Unlock()
 	return nil
-}
-
-// ForceRelease forcefully releases a lock regardless of holder, waking all waiters.
-func (m *LockManager) ForceRelease(namespace, release string) {
-	key := LockKey{Namespace: namespace, Release: release}
-	m.mu.Lock()
-	entry, exists := m.locks[key]
-	if !exists {
-		m.mu.Unlock()
-		return
-	}
-	entry.mu.Lock()
-	entry.holder = ""
-	entry.expAt = 0
-	for _, ch := range entry.waiters {
-		ch <- WaiterResult{Locked: false, Err: errors.New("force released")}
-		close(ch)
-	}
-	entry.waiters = nil
-	entry.mu.Unlock()
-	delete(m.locks, key)
-	m.mu.Unlock()
 }
 
 // IsLocked reports whether the lock for (namespace, release) is currently held.

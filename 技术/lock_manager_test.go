@@ -16,7 +16,7 @@ func TestAcquireRelease_Success(t *testing.T) {
 	m := NewLockManager(100 * time.Millisecond)
 	defer m.Shutdown()
 
-	ok, err := m.Acquire(context.Background(), "ns1", "r1", 5*time.Second, "holder1")
+	ok, err := m.Acquire(context.Background(), "ns1", "r1", 5*time.Second)
 	if err != nil {
 		t.Fatalf("Acquire failed: %v", err)
 	}
@@ -27,7 +27,7 @@ func TestAcquireRelease_Success(t *testing.T) {
 		t.Fatal("expected IsLocked to be true")
 	}
 
-	err = m.Release("ns1", "r1", "holder1")
+	err = m.Release("ns1", "r1")
 	if err != nil {
 		t.Fatalf("Release failed: %v", err)
 	}
@@ -40,29 +40,20 @@ func TestAcquire_DifferentKeysNoConflict(t *testing.T) {
 	m := NewLockManager(100 * time.Millisecond)
 	defer m.Shutdown()
 
-	ok1, err := m.Acquire(context.Background(), "ns1", "r1", 5*time.Second, "holder1")
-	if err != nil || !ok1 {
-		t.Fatal("failed to acquire ns1/r1")
-	}
-	ok2, err := m.Acquire(context.Background(), "ns1", "r2", 5*time.Second, "holder2")
-	if err != nil || !ok2 {
-		t.Fatal("failed to acquire ns1/r2")
-	}
-	ok3, err := m.Acquire(context.Background(), "ns2", "r1", 5*time.Second, "holder3")
-	if err != nil || !ok3 {
-		t.Fatal("failed to acquire ns2/r1")
-	}
+	ok1, _ := m.Acquire(context.Background(), "ns1", "r1", 5*time.Second)
+	ok2, _ := m.Acquire(context.Background(), "ns1", "r2", 5*time.Second)
+	ok3, _ := m.Acquire(context.Background(), "ns2", "r1", 5*time.Second)
 
-	m.Release("ns1", "r1", "holder1")
-	m.Release("ns1", "r2", "holder2")
-	m.Release("ns2", "r1", "holder3")
+	if !ok1 || !ok2 || !ok3 {
+		t.Fatal("different keys should not conflict")
+	}
 }
 
 func TestRelease_NotHeld(t *testing.T) {
 	m := NewLockManager(100 * time.Millisecond)
 	defer m.Shutdown()
 
-	err := m.Release("ns1", "r1", "wrong_holder")
+	err := m.Release("ns1", "r1")
 	if !errors.Is(err, ErrLockNotHeld) {
 		t.Fatalf("expected ErrLockNotHeld, got: %v", err)
 	}
@@ -74,15 +65,12 @@ func TestAcquire_Timeout(t *testing.T) {
 	m := NewLockManager(100 * time.Millisecond)
 	defer m.Shutdown()
 
-	_, err := m.Acquire(context.Background(), "ns1", "r1", 5*time.Second, "holder1")
-	if err != nil {
-		t.Fatalf("first Acquire failed: %v", err)
-	}
+	m.Acquire(context.Background(), "ns1", "r1", 5*time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	ok, err := m.Acquire(ctx, "ns1", "r1", 500*time.Millisecond, "holder2")
+	ok, err := m.Acquire(ctx, "ns1", "r1", 500*time.Millisecond)
 	if ok {
 		t.Fatal("expected failure to acquire held lock")
 	}
@@ -95,10 +83,7 @@ func TestAcquire_ContextCancelled(t *testing.T) {
 	m := NewLockManager(100 * time.Millisecond)
 	defer m.Shutdown()
 
-	_, err := m.Acquire(context.Background(), "ns1", "r1", 5*time.Second, "holder1")
-	if err != nil {
-		t.Fatalf("first Acquire failed: %v", err)
-	}
+	m.Acquire(context.Background(), "ns1", "r1", 5*time.Second)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -106,7 +91,7 @@ func TestAcquire_ContextCancelled(t *testing.T) {
 		cancel()
 	}()
 
-	ok, err := m.Acquire(ctx, "ns1", "r1", 5*time.Second, "holder2")
+	ok, err := m.Acquire(ctx, "ns1", "r1", 5*time.Second)
 	if ok {
 		t.Fatal("expected failure after context cancel")
 	}
@@ -129,15 +114,15 @@ func TestAcquire_Concurrent(t *testing.T) {
 
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
-		go func(id int) {
+		go func() {
 			defer wg.Done()
-			ok, _ := m.Acquire(ctx, "ns1", "r1", 2*time.Second, fmt.Sprintf("holder-%d", id))
+			ok, _ := m.Acquire(ctx, "ns1", "r1", 2*time.Second)
 			if ok {
 				atomic.AddInt32(&acquired, 1)
 				time.Sleep(50 * time.Millisecond)
-				m.Release("ns1", "r1", fmt.Sprintf("holder-%d", id))
+				m.Release("ns1", "r1")
 			}
-		}(i)
+		}()
 	}
 
 	wg.Wait()
@@ -146,16 +131,13 @@ func TestAcquire_Concurrent(t *testing.T) {
 	}
 }
 
-// --- FIFO (all goroutines eventually acquire) ---
+// --- All goroutines eventually acquire ---
 
-func TestAcquire_AllGoroutinesEventuallyAcquire(t *testing.T) {
+func TestAcquire_AllEventuallyAcquire(t *testing.T) {
 	m := NewLockManager(100 * time.Millisecond)
 	defer m.Shutdown()
 
-	_, err := m.Acquire(context.Background(), "ns1", "r1", 5*time.Second, "holder1")
-	if err != nil {
-		t.Fatalf("Acquire failed: %v", err)
-	}
+	m.Acquire(context.Background(), "ns1", "r1", 5*time.Second)
 
 	const n = 5
 	results := make([]bool, n)
@@ -167,62 +149,62 @@ func TestAcquire_AllGoroutinesEventuallyAcquire(t *testing.T) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			ok, _ := m.Acquire(ctx, "ns1", "r1", 3*time.Second, fmt.Sprintf("holder-%d", idx))
+			ok, _ := m.Acquire(ctx, "ns1", "r1", 3*time.Second)
 			results[idx] = ok
 			if ok {
 				time.Sleep(10 * time.Millisecond)
-				m.Release("ns1", "r1", fmt.Sprintf("holder-%d", idx))
+				m.Release("ns1", "r1")
 			}
 		}(i)
 	}
 
 	time.Sleep(50 * time.Millisecond)
-	m.Release("ns1", "r1", "holder1")
+	m.Release("ns1", "r1")
 
 	wg.Wait()
 
-	acquiredCount := 0
+	acquired := 0
 	for _, v := range results {
 		if v {
-			acquiredCount++
+			acquired++
 		}
 	}
-	if acquiredCount != n {
-		t.Errorf("expected all %d goroutines to acquire eventually, got %d", n, acquiredCount)
+	if acquired != n {
+		t.Errorf("expected all %d to acquire, got %d", n, acquired)
 	}
 }
 
 // --- Panic Safety ---
 
-func TestAcquireRelease_PanicSafe(t *testing.T) {
+func TestAcquire_PanicSafe(t *testing.T) {
 	m := NewLockManager(100 * time.Millisecond)
 	defer m.Shutdown()
 
 	var panicked bool
 	func() {
 		defer func() {
-			if r := recover(); r != nil {
+			if recover() != nil {
 				panicked = true
 			}
 		}()
-		ok, err := m.Acquire(context.Background(), "ns1", "r1", 5*time.Second, "holder1")
+		ok, err := m.Acquire(context.Background(), "ns1", "r1", 5*time.Second)
 		if !ok || err != nil {
 			t.Fatalf("Acquire failed: %v", err)
 		}
-		panic("simulated upgrade panic")
+		panic("upgrade failed")
 	}()
 
 	if !panicked {
-		t.Fatal("expected panic to have occurred")
+		t.Fatal("expected panic")
 	}
 
-	// With real defer+recover in calling code, Release would be called here.
-	err := m.Release("ns1", "r1", "holder1")
+	// Caller's defer would call Release here.
+	err := m.Release("ns1", "r1")
 	if err != nil {
-		t.Fatalf("Release failed after panic defer: %v", err)
+		t.Fatalf("Release failed: %v", err)
 	}
 	if m.IsLocked("ns1", "r1") {
-		t.Fatal("lock should not be held after Release")
+		t.Fatal("lock should not be held")
 	}
 }
 
@@ -230,19 +212,12 @@ func TestRelease_DoubleRelease(t *testing.T) {
 	m := NewLockManager(100 * time.Millisecond)
 	defer m.Shutdown()
 
-	_, err := m.Acquire(context.Background(), "ns1", "r1", 5*time.Second, "holder1")
-	if err != nil {
-		t.Fatalf("Acquire failed: %v", err)
-	}
+	m.Acquire(context.Background(), "ns1", "r1", 5*time.Second)
 
-	err = m.Release("ns1", "r1", "holder1")
-	if err != nil {
-		t.Fatalf("first Release failed: %v", err)
-	}
-
-	err = m.Release("ns1", "r1", "holder1")
+	m.Release("ns1", "r1")
+	err := m.Release("ns1", "r1")
 	if !errors.Is(err, ErrLockNotHeld) {
-		t.Fatalf("expected ErrLockNotHeld on double release, got: %v", err)
+		t.Fatalf("expected ErrLockNotHeld, got: %v", err)
 	}
 }
 
@@ -252,7 +227,7 @@ func TestExpiredLock_CleanedUp(t *testing.T) {
 	m := NewLockManager(50 * time.Millisecond)
 	defer m.Shutdown()
 
-	// Simulate a lock held by a crashed holder.
+	// Simulate an expired lock by directly manipulating the entry.
 	key := LockKey{Namespace: "ns1", Release: "r1"}
 	func() {
 		m.mu.Lock()
@@ -263,7 +238,7 @@ func TestExpiredLock_CleanedUp(t *testing.T) {
 			m.locks[key] = entry
 		}
 		entry.mu.Lock()
-		entry.holder = "dead-holder"
+		entry.holder = "locked"
 		entry.expAt = time.Now().Add(-100 * time.Millisecond).UnixNano()
 		entry.mu.Unlock()
 	}()
@@ -275,39 +250,25 @@ func TestExpiredLock_CleanedUp(t *testing.T) {
 	}
 }
 
-// --- ForceRelease ---
-
-func TestForceRelease(t *testing.T) {
-	m := NewLockManager(100 * time.Millisecond)
-	defer m.Shutdown()
-
-	_, err := m.Acquire(context.Background(), "ns1", "r1", 5*time.Second, "holder1")
-	if err != nil {
-		t.Fatalf("Acquire failed: %v", err)
-	}
-
-	m.ForceRelease("ns1", "r1")
-	if m.IsLocked("ns1", "r1") {
-		t.Fatal("expected lock to be force-released")
-	}
-
-	ok, err := m.Acquire(context.Background(), "ns1", "r1", 100*time.Millisecond, "new-holder")
-	if err != nil {
-		t.Fatalf("Acquire after ForceRelease failed: %v", err)
-	}
-	if !ok {
-		t.Fatal("expected to acquire after ForceRelease")
-	}
-}
-
 // --- Invalid Input ---
 
 func TestAcquire_ZeroTimeout(t *testing.T) {
 	m := NewLockManager(100 * time.Millisecond)
 	defer m.Shutdown()
 
-	_, err := m.Acquire(context.Background(), "ns1", "r1", 0, "holder1")
+	_, err := m.Acquire(context.Background(), "ns1", "r1", 0)
 	if err == nil {
 		t.Fatal("expected error for zero timeout")
+	}
+}
+
+// --- IsLocked on non-existent key ---
+
+func TestIsLocked_NonExistent(t *testing.T) {
+	m := NewLockManager(100 * time.Millisecond)
+	defer m.Shutdown()
+
+	if m.IsLocked("ns1", "r1") {
+		t.Fatal("expected false for non-existent lock")
 	}
 }
