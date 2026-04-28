@@ -8,6 +8,7 @@ import (
 
 type state struct {
 	deadline int64
+	locked   bool
 	cond     *sync.Cond
 }
 
@@ -26,13 +27,14 @@ func Acquire(namespace, release string, timeout time.Duration) bool {
 		e, exists := m[key]
 		if !exists {
 			// Lock is free; acquire it.
-			m[key] = &state{deadline: time.Now().Add(timeout).UnixNano()}
+			m[key] = &state{deadline: time.Now().Add(timeout).UnixNano(), locked: true}
 			mu.Unlock()
 			return true
 		}
-		if time.Now().UnixNano() >= e.deadline {
-			// Lock is expired; take it over.
+		if !e.locked || time.Now().UnixNano() >= e.deadline {
+			// Lock is free or expired; take it over.
 			e.deadline = time.Now().Add(timeout).UnixNano()
+			e.locked = true
 			mu.Unlock()
 			return true
 		}
@@ -55,9 +57,12 @@ func Acquire(namespace, release string, timeout time.Duration) bool {
 func Release(namespace, release string) {
 	key := namespace + "/" + release
 	mu.Lock()
-	if e, ok := m[key]; ok && e.cond != nil {
-		e.cond.Signal()
-	} else {
+	if e, ok := m[key]; ok {
+		e.locked = false
+		e.deadline = 0
+		if e.cond != nil {
+			e.cond.Broadcast()
+		}
 		delete(m, key)
 	}
 	mu.Unlock()

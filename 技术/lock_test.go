@@ -89,7 +89,7 @@ func TestAcquire_ExpiredLockReclaimed(t *testing.T) {
 	// Simulate an expired lock by directly setting it in the map.
 	key := "ns1/r1"
 	mu.Lock()
-	m[key] = &state{deadline: time.Now().Add(-100 * time.Millisecond).UnixNano()}
+	m[key] = &state{deadline: time.Now().Add(-100 * time.Millisecond).UnixNano(), locked: true}
 	mu.Unlock()
 
 	ok := Acquire("ns1", "r1", 100*time.Millisecond)
