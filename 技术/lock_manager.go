@@ -17,7 +17,7 @@ var ErrLockAcquireTimeout = errors.New("lock acquisition timeout")
 // LockKey uniquely identifies a lock target (namespace + release).
 type LockKey struct {
 	Namespace string
-	Release   string
+	Release  string
 }
 
 func (k LockKey) String() string {
@@ -37,65 +37,17 @@ type LockEntry struct {
 type LockManager struct {
 	mu    sync.Mutex
 	locks map[LockKey]*LockEntry
-
-	cleanupInterval time.Duration
-	stopCleanup    chan struct{}
 }
 
 // NewLockManager creates a LockManager.
-// The cleanup goroutine runs until Shutdown is called.
-func NewLockManager(cleanupInterval time.Duration) *LockManager {
-	if cleanupInterval <= 0 {
-		cleanupInterval = 30 * time.Second
-	}
-	m := &LockManager{
-		locks:           make(map[LockKey]*LockEntry),
-		cleanupInterval: cleanupInterval,
-		stopCleanup:     make(chan struct{}),
-	}
-	go m.cleanupLoop()
-	return m
-}
-
-// Shutdown stops the background cleanup goroutine.
-func (m *LockManager) Shutdown() {
-	close(m.stopCleanup)
-}
-
-// cleanupLoop periodically removes expired locks.
-func (m *LockManager) cleanupLoop() {
-	ticker := time.NewTicker(m.cleanupInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			m.mu.Lock()
-			now := time.Now().UnixNano()
-			for key, entry := range m.locks {
-				entry.mu.Lock()
-				if entry.holder == "" || entry.expAt == 0 || now < entry.expAt {
-					entry.mu.Unlock()
-					continue
-				}
-				entry.holder = ""
-				entry.expAt = 0
-				for _, ch := range entry.waiters {
-					close(ch)
-				}
-				entry.waiters = nil
-				entry.mu.Unlock()
-				delete(m.locks, key)
-			}
-			m.mu.Unlock()
-		case <-m.stopCleanup:
-			return
-		}
+func NewLockManager() *LockManager {
+	return &LockManager{
+		locks: make(map[LockKey]*LockEntry),
 	}
 }
 
 // Acquire acquires the exclusive lock for (namespace, release).
-// It waits up to 'timeout' for the lock. If the timeout is reached, returns false.
-// Use context only for cancellation; use timeout for the hard time limit.
+// Waits up to 'timeout' for the lock. If the timeout is reached, returns false.
 func (m *LockManager) Acquire(
 	ctx context.Context,
 	namespace, release string,
@@ -124,6 +76,7 @@ func (m *LockManager) Acquire(
 		}
 		entry.mu.Lock()
 		defer entry.mu.Unlock()
+		// Double-check after acquiring entry lock.
 		if entry.holder == "" || time.Now().UnixNano() >= entry.expAt {
 			entry.holder = "locked"
 			entry.expAt = deadline.UnixNano()
@@ -135,7 +88,7 @@ func (m *LockManager) Acquire(
 		entry.mu.Unlock()
 	}()
 
-	timer := time.NewTimer(time.Until(deadline))
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	select {
@@ -151,21 +104,19 @@ func (m *LockManager) Acquire(
 }
 
 // tryAcquire attempts a single optimistic acquisition.
-// Returns true if acquired.
+// Caller must hold m.mu.
+// Returns true if the lock was acquired.
 func (m *LockManager) tryAcquire(key LockKey, deadline time.Time) bool {
-	m.mu.Lock()
 	entry, exists := m.locks[key]
 	if !exists {
 		entry = &LockEntry{}
 		m.locks[key] = entry
-		m.mu.Unlock()
 		entry.mu.Lock()
 		entry.holder = "locked"
 		entry.expAt = deadline.UnixNano()
 		entry.mu.Unlock()
 		return true
 	}
-	m.mu.Unlock()
 
 	entry.mu.Lock()
 	defer entry.mu.Unlock()

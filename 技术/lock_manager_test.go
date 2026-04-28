@@ -13,8 +13,7 @@ import (
 // --- Basic Acquire/Release ---
 
 func TestAcquireRelease_Success(t *testing.T) {
-	m := NewLockManager(100 * time.Millisecond)
-	defer m.Shutdown()
+	m := NewLockManager()
 
 	ok, err := m.Acquire(context.Background(), "ns1", "r1", 5*time.Second)
 	if err != nil {
@@ -37,8 +36,7 @@ func TestAcquireRelease_Success(t *testing.T) {
 }
 
 func TestAcquire_DifferentKeysNoConflict(t *testing.T) {
-	m := NewLockManager(100 * time.Millisecond)
-	defer m.Shutdown()
+	m := NewLockManager()
 
 	ok1, _ := m.Acquire(context.Background(), "ns1", "r1", 5*time.Second)
 	ok2, _ := m.Acquire(context.Background(), "ns1", "r2", 5*time.Second)
@@ -50,8 +48,7 @@ func TestAcquire_DifferentKeysNoConflict(t *testing.T) {
 }
 
 func TestRelease_NotHeld(t *testing.T) {
-	m := NewLockManager(100 * time.Millisecond)
-	defer m.Shutdown()
+	m := NewLockManager()
 
 	err := m.Release("ns1", "r1")
 	if !errors.Is(err, ErrLockNotHeld) {
@@ -62,8 +59,7 @@ func TestRelease_NotHeld(t *testing.T) {
 // --- Timeout ---
 
 func TestAcquire_Timeout(t *testing.T) {
-	m := NewLockManager(100 * time.Millisecond)
-	defer m.Shutdown()
+	m := NewLockManager()
 
 	m.Acquire(context.Background(), "ns1", "r1", 5*time.Second)
 
@@ -80,8 +76,7 @@ func TestAcquire_Timeout(t *testing.T) {
 }
 
 func TestAcquire_ContextCancelled(t *testing.T) {
-	m := NewLockManager(100 * time.Millisecond)
-	defer m.Shutdown()
+	m := NewLockManager()
 
 	m.Acquire(context.Background(), "ns1", "r1", 5*time.Second)
 
@@ -103,8 +98,7 @@ func TestAcquire_ContextCancelled(t *testing.T) {
 // --- Concurrent Acquisition ---
 
 func TestAcquire_Concurrent(t *testing.T) {
-	m := NewLockManager(100 * time.Millisecond)
-	defer m.Shutdown()
+	m := NewLockManager()
 
 	const goroutines = 10
 	var acquired int32
@@ -134,8 +128,7 @@ func TestAcquire_Concurrent(t *testing.T) {
 // --- All goroutines eventually acquire ---
 
 func TestAcquire_AllEventuallyAcquire(t *testing.T) {
-	m := NewLockManager(100 * time.Millisecond)
-	defer m.Shutdown()
+	m := NewLockManager()
 
 	m.Acquire(context.Background(), "ns1", "r1", 5*time.Second)
 
@@ -177,8 +170,7 @@ func TestAcquire_AllEventuallyAcquire(t *testing.T) {
 // --- Panic Safety ---
 
 func TestAcquire_PanicSafe(t *testing.T) {
-	m := NewLockManager(100 * time.Millisecond)
-	defer m.Shutdown()
+	m := NewLockManager()
 
 	var panicked bool
 	func() {
@@ -209,8 +201,7 @@ func TestAcquire_PanicSafe(t *testing.T) {
 }
 
 func TestRelease_DoubleRelease(t *testing.T) {
-	m := NewLockManager(100 * time.Millisecond)
-	defer m.Shutdown()
+	m := NewLockManager()
 
 	m.Acquire(context.Background(), "ns1", "r1", 5*time.Second)
 
@@ -221,13 +212,12 @@ func TestRelease_DoubleRelease(t *testing.T) {
 	}
 }
 
-// --- Expired Lock Cleanup ---
+// --- Expired lock is auto-reclaimed ---
 
-func TestExpiredLock_CleanedUp(t *testing.T) {
-	m := NewLockManager(50 * time.Millisecond)
-	defer m.Shutdown()
+func TestExpiredLock_AutoReclaimed(t *testing.T) {
+	m := NewLockManager()
 
-	// Simulate an expired lock by directly manipulating the entry.
+	// Simulate a lock held by a crashed holder.
 	key := LockKey{Namespace: "ns1", Release: "r1"}
 	func() {
 		m.mu.Lock()
@@ -239,22 +229,25 @@ func TestExpiredLock_CleanedUp(t *testing.T) {
 		}
 		entry.mu.Lock()
 		entry.holder = "locked"
+		// Already expired 100ms ago.
 		entry.expAt = time.Now().Add(-100 * time.Millisecond).UnixNano()
 		entry.mu.Unlock()
 	}()
 
-	time.Sleep(200 * time.Millisecond)
-
-	if m.IsLocked("ns1", "r1") {
-		t.Fatal("expected expired lock to be cleaned up")
+	// Acquire should succeed immediately since the previous lock has expired.
+	ok, err := m.Acquire(context.Background(), "ns1", "r1", 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected to acquire expired lock")
 	}
 }
 
 // --- Invalid Input ---
 
 func TestAcquire_ZeroTimeout(t *testing.T) {
-	m := NewLockManager(100 * time.Millisecond)
-	defer m.Shutdown()
+	m := NewLockManager()
 
 	_, err := m.Acquire(context.Background(), "ns1", "r1", 0)
 	if err == nil {
@@ -265,10 +258,38 @@ func TestAcquire_ZeroTimeout(t *testing.T) {
 // --- IsLocked on non-existent key ---
 
 func TestIsLocked_NonExistent(t *testing.T) {
-	m := NewLockManager(100 * time.Millisecond)
-	defer m.Shutdown()
+	m := NewLockManager()
 
 	if m.IsLocked("ns1", "r1") {
 		t.Fatal("expected false for non-existent lock")
 	}
+}
+
+// --- Stress test: rapid acquire/release cycles ---
+
+func TestAcquire_Stress(t *testing.T) {
+	m := NewLockManager()
+	const n = 100
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					ok, _ := m.Acquire(ctx, "ns1", "r1", 500*time.Millisecond)
+					if ok {
+						m.Release("ns1", "r1")
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
